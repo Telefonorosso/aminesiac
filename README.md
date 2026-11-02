@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="cover.jpg" alt="RADIOHEAD REFERENCE FTW">
+</p>
+
 # aminesiac - AI CODED
 
 **Volatile Copy-on-Write snapshots for AmigaOS on PiStorm / Emu68**
