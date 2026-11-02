@@ -1,8 +1,6 @@
-# aminesiac
+# aminesiac - AI CODED
 
 **Volatile Copy-on-Write snapshots for AmigaOS on PiStorm / Emu68**
-
-*Make changes. Reboot. Keep working. Power off. Start again from the original disk.*
 
 `aminesiac` is a native AmigaOS 68k utility that places a RAM-based, sector-level Copy-on-Write (COW) overlay in front of the Raspberry Pi microSD storage exposed by Emu68's `brcm-sdhc.device`. Writes intercepted by the overlay are retained in RAM; reads see those changes as if they had been written to the disk. A normal Ctrl-Amiga-Amiga warm reset retains the snapshot, while a **complete power-off of both the Amiga and Raspberry Pi** discards it.
 
@@ -13,13 +11,17 @@ This is not a file copier, a filesystem driver, an HDF emulator, or a modified E
 
 ## Why this matters
 
-A modern storage-snapshot technique can run **inside an authentic 1990s operating system**, without replacing AmigaDOS, replacing the filesystem, running Linux underneath it, or modifying the SD driver. The project combines three mechanisms that are particularly well suited to PiStorm/Emu68:
+A modern storage-snapshot technique can run **inside an authentic 1990s operating system**, without replacing AmigaDOS, replacing the filesystem, running Linux underneath it, or permanently modifying the SD driver. The project combines three mechanisms that are particularly well suited to PiStorm/Emu68:
 
 1. **Native Exec device interception.** Standard AmigaOS `SetFunction()` hooks intercept the device I/O path below the filesystem. The same overlay can therefore cover ordinary file writes *and* filesystem metadata updates, without needing to understand PFS3, FFS, or individual AmigaDOS operations.
 2. **Warm-reset persistence.** A COLDSTART resident and carefully registered `KickMem` preserve the COW mapping and its FAST RAM allocation across supported Ctrl-Amiga-Amiga resets, then re-establish the necessary hooks as AmigaOS starts again.
 3. **Two different lifetimes.** AmigaOS can restart while the PiStorm/Emu68 memory holding the snapshot remains available. A full hardware power-off ends that memory lifetime and restores the underlying disk's observable state, apart from any actual physical writes made outside the protection window.
 
 The result is a practical demonstration of how the original AmigaOS/Exec architecture can support a surprisingly sophisticated, modern-style storage service using native interfaces alone. PiStorm supplies the abundant RAM and the favorable reset behavior; AmigaOS supplies the resident and device abstractions.
+
+### File Deletions Are Reversible Too
+
+**aminesiac doesn't just revert newly created or modified files—it also reverses file deletions.** Files and entire directories deleted during a protected session are automatically restored to their original state after a full power cycle, even if the Recycle Bin or any equivalent recovery mechanism is not involved. Remarkably, deleting a large file does **not** require storing a copy of its contents in volatile memory: the original data remains untouched on the physical microSD, while aminesiac only needs to preserve the relatively small number of modified filesystem metadata blocks, such as allocation maps, directory structures, and indexes. This means that deleting a 1 GB file does not consume 1 GB of COW memory. The actual memory overhead depends on the filesystem metadata changes, making reversible deletions exceptionally space-efficient—even when removing large amounts of data.
 
 ### I/O model
 
@@ -172,7 +174,7 @@ The following procedure is deliberately conservative. Use **only disposable data
    aminesiac STATUS
    ```
 
-5. **Warm reset:** perform Ctrl-Amiga-Amiga without removing power from PiStorm. **Do not run `ARM` again.** Inspect `STATUS` and read the file again. The COW content should survive the reset in the supported configuration.
+5. **Warm reset(s):** perform Ctrl-Amiga-Amiga without removing power from PiStorm. **Do not run `ARM` again.** Inspect `STATUS` and read the file again. The COW content should survive the reset in the supported configuration.
 6. **End the session:** switch off both Amiga and Raspberry Pi completely. On the next cold boot, verify that the test file has disappeared; only physical changes made outside/bypassing the overlay can remain.
 7. **Check filesystem health:** after returning to the unarmed, original view, use a non-destructive filesystem check (for PFS3, a PFSDoctor inspection is useful). Keep backups and compare against a known baseline if physical integrity matters.
 
@@ -205,7 +207,7 @@ The warm-reset reinstallation also depends on real boot ordering and Exec behavi
 
 ### Power and data loss
 
-Full power removal discards **all** changes in the RAM snapshot, including anything created, installed or configured while it was active. An abrupt power loss or crash has the same risk of losing the snapshot and may interrupt an operation in progress. Never treat the overlay as durable storage, and never test on irreplaceable media.
+Full power removal discards **all** changes in the RAM snapshot, including anything created, deleted, installed or configured while it was active. An abrupt power loss or crash has the same risk of losing the snapshot and may interrupt an operation in progress. Never treat the overlay as durable storage, and never test on irreplaceable media.
 
 ## Build from source
 
