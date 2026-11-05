@@ -4,28 +4,32 @@
 
 # aminesiac - AI CODED
 
-**Volatile Copy-on-Write snapshots for AmigaOS on PiStorm / Emu68**
+**Volatile, dynamically allocated Copy-on-Write snapshots for AmigaOS on PiStorm / Emu68**
 
-`aminesiac` is a native AmigaOS 68k utility that places a RAM-based, sector-level Copy-on-Write (COW) overlay in front of the Raspberry Pi microSD storage exposed by Emu68's `brcm-sdhc.device`. Writes intercepted by the overlay are retained in RAM; reads see those changes as if they had been written to the disk. A normal Ctrl-Amiga-Amiga warm reset retains the snapshot, while a **complete power-off of both the Amiga and Raspberry Pi** discards it.
+`aminesiac` is a native AmigaOS 68k utility that places a RAM-based, sector-level Copy-on-Write (COW) overlay in front of the Raspberry Pi microSD storage exposed by Emu68's `brcm-sdhc.device`. Intercepted writes stay in RAM, while reads see the modified sectors as though they were on disk. A normal Ctrl-Amiga-Amiga warm reset retains the snapshot; a **complete power-off of both the Amiga and Raspberry Pi** discards it.
 
-This is not a file copier, a filesystem driver, an HDF emulator, or a modified Emu68 build. The existing AmigaOS filesystem continues to operate on what appears to be an ordinary block device.
+COW memory is **allocated on demand**, rather than reserving the entire configured snapshot capacity at activation. A small, autonomous Intuition task in the resident also displays **`DISPOSABLE SESSION!`** on the Workbench title bar to remind the user that changes are temporary. No separate indicator program or WBStartup entry is required.
+
+This is not a file copier, a filesystem driver, an HDF emulator, or a modified Emu68 build. AmigaOS and its existing filesystem continue to see an ordinary block device.
 
 > [!WARNING]
-> **Experimental storage interception — use a disposable, fully backed-up clone of your microSD.** The observed rollback is a functional property of the tested configuration, **not a guarantee that the physical card is never written**. See [Safety and limitations](#safety-and-limitations) before enabling it.
+> **Experimental storage interception — use only a disposable, fully backed-up clone of your microSD.** Functional rollback and clean filesystem checks do **not** prove that no physical sector was written. See [Safety and limitations](#safety-and-limitations) before enabling it.
 
 ## Why this matters
 
-A modern storage-snapshot technique can run **inside an authentic 1990s operating system**, without replacing AmigaDOS, replacing the filesystem, running Linux underneath it, or permanently modifying the SD driver. The project combines three mechanisms that are particularly well suited to PiStorm/Emu68:
+A modern storage-snapshot technique can run **inside an authentic 1990s operating system**, without replacing AmigaDOS or the filesystem, running Linux underneath it, or permanently modifying the SD driver. The project combines five mechanisms:
 
-1. **Native Exec device interception.** Standard AmigaOS `SetFunction()` hooks intercept the device I/O path below the filesystem. The same overlay can therefore cover ordinary file writes *and* filesystem metadata updates, without needing to understand PFS3, FFS, or individual AmigaDOS operations.
-2. **Warm-reset persistence.** A COLDSTART resident and carefully registered `KickMem` preserve the COW mapping and its FAST RAM allocation across supported Ctrl-Amiga-Amiga resets, then re-establish the necessary hooks as AmigaOS starts again.
-3. **Two different lifetimes.** AmigaOS can restart while the PiStorm/Emu68 memory holding the snapshot remains available. A full hardware power-off ends that memory lifetime and restores the underlying disk's observable state, apart from any actual physical writes made outside the protection window.
+1. **Native Exec device interception.** Standard AmigaOS `SetFunction()` hooks intercept block-device I/O below the filesystem, including ordinary file data and filesystem metadata updates.
+2. **Dynamic COW allocation.** A hash table is reserved at activation, while sector data grows in small FAST+KICK blocks as distinct disk sectors are modified. Unused snapshot capacity does not occupy the full corresponding data RAM.
+3. **Warm-reset persistence.** A COLDSTART resident and `KickMem` preserve the COW mapping and its dynamically registered FAST RAM blocks across supported Ctrl-Amiga-Amiga resets, then restore the device interception path during boot.
+4. **Two different lifetimes.** AmigaOS can restart while PiStorm/Emu68 snapshot memory is retained. A complete hardware power-off ends that memory lifetime and restores the underlying disk's observable state, except for any actual physical writes outside or bypassing the protection window.
+5. **Resident visual warning.** The module itself creates a minimal Workbench banner, **`DISPOSABLE SESSION!`**, when the worker and SD interception hooks are operational. The banner is independent of the storage I/O worker and requires no startup script.
 
-The result is a practical demonstration of how the original AmigaOS/Exec architecture can support a surprisingly sophisticated, modern-style storage service using native interfaces alone. PiStorm supplies the abundant RAM and the favorable reset behavior; AmigaOS supplies the resident and device abstractions.
+The result demonstrates how the original AmigaOS/Exec resident, memory and device interfaces can support a modern-style, volatile storage service. PiStorm provides the RAM and favorable warm-reset behavior; AmigaOS provides the native system abstractions.
 
-### File Deletions Are Reversible Too
+### File deletions are reversible too
 
-**aminesiac doesn't just revert newly created or modified files—it also reverses file deletions.** Files and entire directories deleted during a protected session are automatically restored to their original state after a full power cycle, even if the Recycle Bin or any equivalent recovery mechanism is not involved. Remarkably, deleting a large file does **not** require storing a copy of its contents in volatile memory: the original data remains untouched on the physical microSD, while aminesiac only needs to preserve the relatively small number of modified filesystem metadata blocks, such as allocation maps, directory structures, and indexes. This means that deleting a 1 GB file does not consume 1 GB of COW memory. The actual memory overhead depends on the filesystem metadata changes, making reversible deletions exceptionally space-efficient—even when removing large amounts of data.
+**aminesiac can roll back created files, modified files and deletions.** Files deleted during a protected session were confirmed to reappear after a complete power cycle on the tested PFS3 volume. There is no need to copy a deleted file's entire contents into the COW solely because it was deleted: the original data remains on the underlying card, while the overlay generally captures changes to directory entries, allocation maps and other filesystem metadata. Actual COW usage depends on the sectors written by the filesystem and applications; deleting a very large file does not necessarily consume a comparable amount of snapshot memory.
 
 ### I/O model
 
@@ -47,68 +51,104 @@ Amiga applications / AmigaDOS
        Coherent logical disk
 ```
 
-The COW is **sector-based (512 bytes)**. For writes, the resident records modified logical sectors in a preallocated FAST RAM arena; for reads, it combines original sectors with the modified sectors from RAM. Both device unit 0 (whole-card offsets) and unit 1 (offsets relative to the single recognized Amiga partition) are translated into one physical-sector address space so aliases remain coherent.
+The overlay is **sector-based (512 bytes)**. Unit 0 (whole-card offsets) and unit 1 (offsets relative to the recognized Amiga partition) map into the same physical-sector address space, so aliases remain coherent. Reads combine unchanged physical sectors with RAM-backed modified sectors.
 
-The resident uses a serialized I/O worker and avoids allocating storage on the write path. Unknown or potentially write-capable device commands are rejected instead of silently passing through to the physical device. These are important safeguards, but they do not turn the project into a hardware write blocker.
+A serialized worker handles COW operations and, when needed, allocates blocks **before** committing a write. No storage allocation is performed inside the `BeginIO` hook itself. If a write cannot fit or memory allocation fails, it is rejected without forwarding that write to the physical driver. Unknown or potentially write-capable commands are also rejected rather than silently passed through. These safeguards do **not** make the program a hardware write blocker.
+
+## Dynamic COW memory
+
+`MEM=N` specifies the **maximum payload capacity**, in MiB, not the amount of sector-data RAM allocated immediately. `N` can be any integer from **4 to 128**, including values such as `MEM=100`.
+
+- At `ARM`, the resident allocates a fixed-size hash table in FAST+KICK RAM, plus small persistent structures in CHIP RAM.
+- Modified sectors are stored in blocks of **2,048 sector records**. Each block holds **1 MiB of sector payload** plus 16 KiB of sector metadata (**1,064,960 bytes per block**).
+- A new block is allocated only when the current blocks cannot hold the additional *distinct* sectors in an incoming write. Rewriting an LBA already in the COW updates its existing record.
+- Each allocated block is registered in `KickMem`; the checksum and block directory are updated so the block can be recovered after a supported warm reset.
+- Allocation only grows during a session. Blocks are not individually reclaimed; the complete snapshot disappears at full power-off.
+
+For example, `MEM=4` offers 8,192 modified-sector slots. Its initial FAST+KICK hash allocation is **64 KiB**, with sector-data blocks added on demand. `MEM=100` offers 204,800 slots; its hash initially uses **2 MiB**, and its sector-data RAM grows in approximately 1.016 MiB increments as needed, up to the configured capacity. Additional resident overhead applies in both cases.
+
+The hash reservation is contiguous, and each newly allocated block must also fit into a suitable FAST+KICK region. A large total amount of free RAM does not guarantee that each block allocation will succeed. Leave adequate RAM for AmigaOS and applications.
+
+### When the COW fills up
+
+The write path is designed to **fail closed**: it does not fall back to writing to the real microSD when the COW is full or a required allocation fails. The resident reports a device I/O error and counts rejected requests in the `full` field of `STATUS`. The error currently used is **`-3`**; PFS3 may display its unsigned 32-bit equivalent, `4294967293`, rather than an AmigaDOS “Disk full” message.
+
+This condition can disrupt the **virtual** filesystem. In an actual `MEM=4` capacity test, PFS3 displayed a write error and the overlaid volume became `NDOS` after cancellation. After a **complete power cycle**, the physical volume was again accessible and working normally, and PFSDoctor reported **zero errors**. This is a functional recovery result on the tested configuration, not a guarantee for all media or a sector-by-sector physical write-protection proof.
+
+**If the COW fills or PFS3 reports an I/O error, stop using the volume and power off both the Amiga and Pi completely.** Do not keep retrying writes or run filesystem repair against the active volatile view.
+
+## Automatic Workbench warning
+
+Once the COW worker is initialized and a Workbench public screen is available, the resident opens a small Intuition title-bar window at the top right, displaying exactly:
+
+```text
+DISPOSABLE SESSION!
+```
+
+- It appears after the **first successful `ARM`** without requiring a reboot, and is created again after a supported **warm reset**.
+- There is **no separate executable**, WBStartup entry, external program, Workbench patch or Emu68 modification.
+- The text is fixed: there is no memory percentage, clock or periodic text refresh.
+- The visual task waits if Workbench is not open; it does **not** launch Workbench. The COW continues to work in CLI-only sessions, without a banner.
+- A lightweight status check monitors the worker and the live `BeginIO`/`AbortIO` hooks. If the resident becomes unhealthy, the window is closed. Visual failure must not prevent COW operation.
+- The window belongs to the Workbench screen: applications using separate screens may cover it.
+
+**The banner is a reminder, not proof of physical write isolation.** Its health check deliberately does not require the Exec `OpenDevice` vector to keep matching the resident after a warm reset; see [Reading `STATUS`](#reading-status).
 
 ## Requirements and compatibility
 
 | Component | Requirement |
 | --- | --- |
-| Computer | Amiga with PiStorm and Emu68; hardware-tested on an Amiga 600 / Raspberry Pi 3A+ configuration |
-| Operating system | AmigaOS with Exec version 39 or newer; other ROM versions have not all been individually validated |
-| Storage driver | `brcm-sdhc.device` exposing compatible standard Exec `BeginIO`/`AbortIO` vectors |
-| Media geometry | 512-byte sectors; MBR partition table; **exactly one primary type `0x76` partition** |
-| Device units | Unit 0 exposes the whole card; unit 1 exposes that `0x76` partition; their sampled contents and reported geometry must agree |
-| Memory | Sufficient **contiguous** FAST+KICK RAM plus a small CHIP RAM allocation for resident state/code |
+| Computer | Amiga with PiStorm and Emu68; hardware-tested on an Amiga 600 / Raspberry Pi 3A+ setup |
+| Operating system | AmigaOS with Exec version 39 or newer; not all Kickstart/Workbench versions have been tested |
+| Storage driver | `brcm-sdhc.device` with compatible standard Exec `BeginIO`/`AbortIO` vectors |
+| Media geometry | 512-byte sectors, MBR partition table, **exactly one primary type `0x76` partition** |
+| Device units | Unit 0 exposes the full card; unit 1 exposes that `0x76` partition; reported geometry and sampled contents must agree |
+| Memory | FAST+KICK RAM for the hash and individual COW blocks, plus a small CHIP RAM allocation for persistent state/code |
 | Filesystems | Transparent at the supported block-device interface; PFS3 has been exercised on real hardware |
+| Workbench display | Optional Workbench public screen with Intuition for the automatic visual warning; COW itself does not require Workbench |
 
-The implementation does **not** bind itself to the driver's version number, Git revision, absolute function addresses, or private structure offsets. Instead, it checks the expected Exec vector format, device geometry, unit mapping, and sampled media contents. That makes it *build-independent by design*, **not automatically compatible with every old or future `brcm-sdhc.device` release**.
+Compatibility is checked through Exec vector format, device geometry, unit mapping and sampled media reads, not by hard-coding driver-version numbers, Git revisions, absolute function addresses or private driver offsets. This is *build-independent by design*, **not** a claim of compatibility with every `brcm-sdhc.device` release.
 
-It does not currently target `brcm-emmc.device` (used by some Pi 4/CM4 configurations), other storage drivers, GPT layouts, multiple `0x76` partitions, or arbitrary SCSI-direct commands. A successful `PROBE` is necessary, but not sufficient, evidence of compatibility.
+Other storage drivers including `brcm-emmc.device`, GPT layouts, multiple `0x76` partitions and arbitrary SCSI-direct commands are not currently supported. A successful `PROBE` is necessary but insufficient evidence of complete compatibility.
 
 ## Quick start
 
-**First make a complete, independently verified backup, and use a spare clone.** Completely power off both the Amiga and Raspberry Pi before inserting it or switching between installations.
+**Make and independently verify a full backup first, and use a disposable clone.** Completely power off both Amiga and Raspberry Pi before inserting the card or changing binaries.
 
-Place **both** files in the same Amiga directory and execute the commands *from that directory*:
+Place these **two files together** in the same Amiga directory, then run commands from that directory:
 
 ```text
 aminesiac
-aminesiac.R3Module
+aminesiac.R4Module
 ```
 
-Set a sufficiently large CLI stack, then run the non-installing compatibility check:
+Perform the non-installing compatibility check:
 
 ```text
 Stack 65536
 aminesiac PROBE
 ```
 
-A successful probe ends with:
+A successful probe reports:
 
 ```text
 [PROBE] PASS: read-only compatibility checks. No hooks installed.
 ```
 
-If, and only if, the probe passes and you accept the risks, activate a 32 MiB snapshot:
+If the probe passes and you accept the risks, activate a snapshot with up to 32 MiB of modified-sector payload:
 
 ```text
 aminesiac ARM MEM=32 I_ACCEPT_RISK
 aminesiac STATUS
 ```
 
-Look for a successful COLDSTART initialization, worker marker `52445932` (`RDY2`), `faults=0`, and all four gates reporting `PASS` immediately after activation. The overall state should be:
+On the first ARM, expect a ready worker (`52445932`, or `RDY2`), `faults=0`, `full=0`, `checksum=PASS` and the device `BeginIO`/`AbortIO` gates reporting `PASS`. At initial activation the four inspected gates are normally `PASS`. With Workbench open, **`DISPOSABLE SESSION!`** should also appear automatically in its title bar.
 
-```text
-[STATUS] ACTIVE-GATED: vectors match; physical isolation NOT independently proven
-```
-
-**Do not run `ARM` again after a warm reset.** Recovery is handled by the resident. There is no `DISARM` command; completely remove power from *both* machines to discard the volatile snapshot.
+**Do not run `ARM` again after a warm reset.** The resident restores the virtual disk session during reboot. There is no `DISARM` command. Only a complete power-off of **both** the Amiga and Raspberry Pi discards the volatile snapshot.
 
 ## Command reference
 
-The CLI accepts exactly these forms (commands and tokens shown as used by the executable):
+The supported commands are:
 
 ```text
 aminesiac PROBE
@@ -116,17 +156,15 @@ aminesiac ARM MEM=N I_ACCEPT_RISK
 aminesiac STATUS
 ```
 
-| Command | What it does |
+| Command | Purpose |
 | --- | --- |
-| `PROBE` | Performs non-installing driver-vector, geometry, partition and sampled-read checks. Requires no pre-existing active resident. |
-| `ARM MEM=N I_ACCEPT_RISK` | Allocates the RAM arena, loads `aminesiac.R3Module`, registers the persistent resident, and installs the I/O interception gates. **Changes system state.** |
-| `STATUS` | Inspects the resident, COW counters, sampled media fingerprint and current interception vectors. Does not arm or disarm the overlay. |
+| `PROBE` | Non-installing checks of driver vectors, geometry, partition mapping and sampled media reads; intended for an unarmed system. |
+| `ARM MEM=N I_ACCEPT_RISK` | Installs `aminesiac.R4Module`, allocates the persistent hash/state, registers the resident and hooks the SD device. Sector-data blocks are allocated subsequently as needed. **Changes system state.** |
+| `STATUS` | Reads persistent state, COW capacity/usage, dynamically allocated blocks, KickMem checksum, media fingerprint and current vector targets. Does not arm or disarm. |
 
-### `MEM=N` — snapshot capacity
+### `MEM=N` — maximum snapshot capacity
 
-`N` is any **whole number from 4 through 128**, expressed in **MiB**, inclusive; it is **not** restricted to powers of two.
-
-Examples:
+`MEM=N` accepts every integer **4 through 128**, in MiB. It is **not** restricted to powers of two.
 
 ```text
 aminesiac ARM MEM=16 I_ACCEPT_RISK
@@ -134,17 +172,17 @@ aminesiac ARM MEM=32 I_ACCEPT_RISK
 aminesiac ARM MEM=100 I_ACCEPT_RISK
 ```
 
-These are alternative one-time invocations on **separate, freshly powered-on sessions**, not commands to run one after another. `MEM=100` provides exactly **100 MiB of modified-sector capacity** (`204800` sectors), rather than silently rounding the COW payload to 128 MiB.
-
-The hash table is sized separately to a power of two. For `MEM=100`, the data/entry area plus hash table reserve approximately **103.6 MiB** of FAST RAM, in addition to resident overhead. Memory is allocated up front; the allocation must succeed with appropriate FAST+KICK attributes. Choose a capacity that leaves sufficient RAM for AmigaOS and applications.
+These are **alternatives for separate cold-start sessions**, not commands to run consecutively. For example, `MEM=100` allows up to **204,800 distinct modified 512-byte sectors**. It does not allocate 100 MiB of sector-data RAM at startup; see [Dynamic COW memory](#dynamic-cow-memory).
 
 ### Reading `STATUS`
 
-A representative live status looks like this (addresses and counters vary):
+Example immediately after a successful first block allocation (addresses and counters vary):
 
 ```text
 [RESIDENT] boots=1 arms=1 worker=52445932 faults=0
-[COW] used=115/65536 writes=10 reads=21 changes=10 busy=00000000
+[COW] used=115/8192 sectors allocated=1/4 blocks (1 payload MiB)
+[COW] writes=10 reads=18 changes=10 busy=00000000 full=0
+[KICK] entries=6 base=5 checksum=PASS
 [GATE] Exec AddDevice=... expected=... PASS
 [GATE] Exec OpenDevice=... expected=... PASS
 [GATE] brcm device=... BeginIO=... expected=... PASS
@@ -152,25 +190,27 @@ A representative live status looks like this (addresses and counters vary):
 [STATUS] ACTIVE-GATED: vectors match; physical isolation NOT independently proven
 ```
 
-- `boots`: resident initialization count, including warm-restart activations.
-- `arms`: installation/arming count.
-- `worker=52445932`: ready marker; `faults=0` is the expected healthy condition.
-- `used/capacity`: **unique sectors currently held in the COW**, not bytes and not the number of write requests. Capacity is `N × 2048` sectors.
-- `writes`, `reads`, `changes`: activity counters; not proof that physical media is unchanged.
-- `busy=0`: no current outstanding persistent-state busy marker at the instant sampled.
-- `GATE ... PASS`: the installed vector still equals the resident's expected hook address. Any `FAIL` means that interception status is **not verified**; it must not be disregarded.
-- `fingerprint`: a small sampled-media consistency value, **not** a whole-card SHA-256 or a cryptographic proof of immutability.
+- `boots`: COLDSTART initialization count, including warm resets.
+- `arms`: successful worker-initialization count; it can increase after warm reset **without** a new `ARM` command.
+- `worker=52445932`: the `RDY2` readiness marker; `faults=0` is the expected healthy state.
+- `used/capacity`: distinct COW sectors held / maximum sector slots. Each sector is 512 bytes; capacity equals `N × 2048` sectors.
+- `allocated=A/B blocks`: 1 MiB-payload blocks currently allocated / maximum permitted for `MEM=N`. The physical RAM per block also includes metadata.
+- `writes`, `reads`, `changes`: activity counters, not evidence of physical-media immutability.
+- `busy=00000000`: no COW write-transaction busy marker at the time sampled.
+- `full`: number of write requests rejected due to capacity or required allocation failure; normally zero.
+- `KICK ... checksum=PASS`: KickMem bookkeeping and checksum agree at the time checked.
+- `fingerprint`: sampled-media consistency value, **not** a cryptographic whole-card digest.
 
-The current runtime checks explicitly recognize a particular 68k Exec jump-vector encoding; other implementations may be rejected even if they are functionally similar.
+**Known warm-reset behavior:** on the tested Kickstart, `ramlib` can replace the Exec `OpenDevice` vector after COLDSTART. Consequently, `STATUS` may show `OpenDevice ... FAIL` and the summary `NOT VERIFIED` even when the COW worker and the SD driver `BeginIO`/`AbortIO` hooks are still present. The resident Workbench banner intentionally does **not** use `OpenDevice` as a display condition. This known interaction must **not** be mistaken for independent proof of safe physical write isolation. If the SD hooks fail, the worker faults, or any other unexpected state appears, stop writes and investigate on a disposable clone.
 
 ## Recommended operational procedure
 
-The following procedure is deliberately conservative. Use **only disposable data on a cloned card**.
+The following procedure is intentionally conservative. Use **only disposable data on a cloned card**.
 
-1. **Cold start:** power off the Amiga and Pi completely, then boot from the clone. Remember that any filesystem activity *before* `ARM` is outside the protected session.
-2. **Preflight:** open a CLI, `Stack 65536`, and run `aminesiac PROBE`. Stop if anything fails.
-3. **Arm once:** run `aminesiac ARM MEM=32 I_ACCEPT_RISK` (or another chosen capacity) and immediately inspect `aminesiac STATUS`.
-4. **Exercise the overlay:** write and read a disposable test file on a known volume backed by the `0x76` partition; for example, if your mounted volume is actually named `SDH1:`:
+1. **Cold start:** fully power off the Amiga and Raspberry Pi, then boot from the clone. Filesystem activity **before `ARM`** is outside the protected session.
+2. **Preflight:** open a CLI, run `Stack 65536` and `aminesiac PROBE`. Stop if the probe fails.
+3. **Arm once:** run `aminesiac ARM MEM=32 I_ACCEPT_RISK` (or another chosen maximum), then `aminesiac STATUS`. If Workbench is open, verify the automatic `DISPOSABLE SESSION!` warning.
+4. **Exercise the overlay:** on a disposable volume backed by the supported `0x76` partition, for example if it is mounted as `SDH1:`:
 
    ```text
    Echo "AMINESIAC_TEST" >SDH1:AMINESIAC.TEST
@@ -178,44 +218,44 @@ The following procedure is deliberately conservative. Use **only disposable data
    aminesiac STATUS
    ```
 
-5. **Warm reset(s):** perform Ctrl-Amiga-Amiga without removing power from PiStorm. **Do not run `ARM` again.** Inspect `STATUS` and read the file again. The COW content should survive the reset in the supported configuration.
-6. **End the session:** switch off both Amiga and Raspberry Pi completely. On the next cold boot, verify that the test file has disappeared; only physical changes made outside/bypassing the overlay can remain.
-7. **Check filesystem health:** after returning to the unarmed, original view, use a non-destructive filesystem check (for PFS3, a PFSDoctor inspection is useful). Keep backups and compare against a known baseline if physical integrity matters.
+5. **Warm reset:** use Ctrl-Amiga-Amiga **without powering down the Pi**. Do not rerun `ARM`. Verify that the file persists in the virtual disk; when Workbench reopens, the resident warning should reappear automatically.
+6. **End the session:** completely power off both machines. On the next cold boot the temporary test file should be gone; files deleted only inside the virtual session should be restored.
+7. **Inspect the underlying filesystem:** use a non-destructive check, such as PFSDoctor for PFS3, after leaving the volatile session. Keep backups and compare against a known baseline when physical integrity matters.
 
-Do not treat an unexpected failure, a missing file, or a gate mismatch as a reason to keep writing. Stop I/O and perform a complete power-off of the clone instead.
+Stop disk activity on unexpected I/O errors, worker faults, invalid KickMem checksum, driver-gate changes or COW exhaustion. Do not attempt filesystem repair while the overlay is active.
 
 ## Safety and limitations
 
 ### Not a physical write-protect mechanism
 
-`aminesiac` hooks the AmigaOS device path; it does **not** modify the Raspberry Pi SD controller or establish hardware-level write protection. In particular:
+`aminesiac` hooks the AmigaOS device I/O path. It does **not** modify the Raspberry Pi SD controller or create hardware-level write protection:
 
-- Writes made **before** activation may already have reached the physical card. Filesystems such as PFS3 can update metadata during mount, even without an explicit user file operation.
-- Driver-private I/O, unforeseen commands, code paths bypassing the hooks, or unexpected boot ordering may still reach the underlying storage.
-- A successful `PROBE`, `ACTIVE-GATED` status, clean PFSDoctor result or functional rollback test cannot by itself prove sector-for-sector physical immutability.
-- The unit/partition audit verifies only the layout and sample sectors it examines; it does not verify the entire microSD.
+- Writes performed **before ARM** may already have reached the real card. PFS3 may modify metadata while mounting a volume.
+- Driver-private I/O, unforeseen commands, code bypassing the hooks, or unexpected boot ordering could still write to the underlying medium.
+- `PROBE`, `STATUS`, the visual banner, successful functional rollback and a clean PFSDoctor run do not independently prove sector-for-sector physical immutability.
+- The geometry and unit/partition checks examine samples, not every physical sector.
 
-A whole-device SHA-256 taken before and after a boot can differ because of legitimate **pre-ARM** changes. That difference is worth investigating at the sector level; it is neither automatic proof of a COW leak nor proof that the COW prevented all physical writes.
+A whole-device SHA-256 calculated across separate boots may differ because of pre-ARM activity. Investigate such differences at sector level rather than treating them as automatic proof for or against an isolation breach.
 
-### No live deactivation, commit or automatic recovery
+### No live deactivation, commit or durable snapshot
 
-There is **no `DISARM`, `COMMIT` or save-snapshot operation**. The intended behavior is to discard the overlay at full power-off. A full power-off is also the safe reset boundary before changing binaries or trying another capacity. A warm reset retains the overlay and may retain any resulting filesystem problems within the current RAM session.
+There is no `DISARM`, `COMMIT` or snapshot-save operation. The intended way to discard the volatile COW is a complete power-off of both Amiga and Raspberry Pi. Warm reset **retains** the session, including any virtual filesystem inconsistency that may have developed.
 
-Do **not** run disk repair, partitioning, formatting, firmware updates or other high-risk storage operations while armed. If a gate fails, `faults` becomes nonzero, or the COW fills up, stop further I/O; the filesystem may have received errors, and subsequent operations must not be trusted. The COW is finite and is **not** permitted to fall back to writing the original disk when full.
+A full power cycle is also the safe boundary for changing binaries or selecting another `MEM` limit. Do **not** run disk repair, partitioning, formatting, firmware updates or destructive storage tools while armed. When the COW becomes full, the filesystem may receive errors and its volatile view may become unusable; stop I/O and power off completely.
 
 ### Supported I/O surface is deliberately narrow
 
-The current worker handles the ordinary supported read/write commands plus selected flush/update operations and passes only known safe control commands. Unknown write-capable commands, unsupported SCSI-direct traffic, unusual unit mappings and unexpected media changes are not treated as safe. Some utilities may therefore receive I/O errors instead of working transparently.
+The worker supports normal read/write commands, selected update/flush operations and known safe control commands. Unknown write-capable operations, unusual unit layouts, unsupported SCSI-direct commands and media changes are not assumed safe; some tools may therefore encounter errors instead of operating transparently.
 
-The warm-reset reinstallation also depends on real boot ordering and Exec behavior. In particular, other system components can replace an Exec vector during startup. Recheck `STATUS` after a reset: **a `FAIL` is a warning, not an endorsement of continued use**, even if the filesystem appears functional.
+Boot ordering and Exec vector ownership can vary. In particular, the known `ramlib` replacement of `OpenDevice` after warm reset is accounted for by the resident visual task, but it does not establish universal compatibility or eliminate the need for careful `STATUS` checks. Do not treat a visual banner as a security certification.
 
-### Power and data loss
+### Power loss and RAM-only data
 
-Full power removal discards **all** changes in the RAM snapshot, including anything created, deleted, installed or configured while it was active. An abrupt power loss or crash has the same risk of losing the snapshot and may interrupt an operation in progress. Never treat the overlay as durable storage, and never test on irreplaceable media.
+Removing power destroys **all** snapshot changes, including files created, modified, deleted, installed or configured in the disposable session. Crashes or abnormal resets can interrupt an operation and may leave the temporary snapshot inconsistent. Never rely on COW data as durable storage or test with irreplaceable media.
 
 ## Build from source
 
-On a Linux cross-build host, install `m68k-amigaos-gcc`, Amiga NDK headers, `make`, Python 3 and a host C compiler. From the source directory:
+On Linux, install the AmigaOS 68k cross compiler `m68k-amigaos-gcc`, Amiga NDK headers, `make`, Python 3 and a host C compiler. From the source directory:
 
 ```sh
 make clean
@@ -225,22 +265,28 @@ make CC=m68k-amigaos-gcc \
      AMIGA_CRT=-mcrt=nix20 \
      all
 
-ls -lh aminesiac aminesiac.R3Module
+ls -lh aminesiac aminesiac.R4Module
 ```
 
-The two resulting files must be deployed **together**. `aminesiac` loads `aminesiac.R3Module` from the current working directory when arming; renaming or mixing different protocol versions can make the installation fail. The build includes a resident ABI check to reject an incompatible module.
+Deploy the two binaries **together**. `aminesiac` loads `aminesiac.R4Module` from the current working directory when arming. The loader checks module compatibility; mixing unrelated builds may fail and is not supported.
 
-No Emu68 patch, Linux service, replacement filesystem, or AmigaOS boot script is needed for normal installation. The source tree provides host-side tests, but **successful compilation and host tests are not a substitute for hardware validation**.
+The visual component is linked into the resident module: **no extra binary, startup script, WBStartup entry, Emu68 patch or replacement filesystem** is needed. Host-side tests do not replace native AmigaOS builds and real-hardware validation.
 
-## Validation scope
+## Hardware validation
 
-The COW behavior has been tested on real Amiga/PiStorm/Emu68 hardware using `brcm-sdhc.device` 1.9, including installation, active read/write interception, preservation across warm reset, and disappearance of virtual changes after a complete power-off. PFS3 integrity checks with PFSDoctor have also passed on the tested volumes. The configurable-memory implementation has been hardware-tested, including the non-power-of-two setting `MEM=100`.
+On the tested Amiga 600 / PiStorm / Emu68 configuration with `brcm-sdhc.device` 1.9 and PFS3, the following functional results have been reported:
 
-These observations establish useful **functional validation on that configuration**. They do not certify every Kickstart, all Emu68 drivers/builds, all filesystem layouts, or absolute physical write isolation.
+- Dynamic block allocation and registration in KickMem, with a valid updated checksum and functioning disk I/O.
+- Persistence of the COW state through **three warm resets** in a dynamic-allocation test.
+- Restoration of deleted files after a complete power cycle.
+- Intentional COW exhaustion at `MEM=4`, with error propagation to PFS3; after full power cycle the physical volume was again usable and PFSDoctor reported **zero errors**.
+- Successful hardware tests of the **integrated resident Workbench warning**: automatic appearance after first `ARM` and return after warm reset, without an external program or WBStartup entry.
+
+These are functional results from the reported hardware tests, not a sector-by-sector physical write-isolation certification. The visual test was reported as passing as a whole; detailed machine logs for that specific build are not included here. Expansion across multiple newly allocated COW blocks and absolute physical-card immutability have not been independently confirmed by the cited tests. Other Kickstart versions, screen configurations, drivers and partition layouts require their own validation.
 
 ## Credits and acknowledgments
 
-**Michal Schulz** ([`michalsc`](https://github.com/michalsc)) is the author of **Emu68 and `brcm-sdhc.device`**, whose native AmigaOS storage interface makes this project possible. His design and work on the Raspberry Pi SD host driver and Emu68's integration with AmigaOS are fundamental to `aminesiac`.
+**Michal Schulz** ([`michalsc`](https://github.com/michalsc)) is the author of **Emu68 and `brcm-sdhc.device`**, whose native AmigaOS storage interface makes this project possible. His work on the Raspberry Pi SD host driver and Emu68's AmigaOS integration is fundamental to `aminesiac`.
 
 - [Emu68 project](https://github.com/michalsc/Emu68)
 - [Emu68 SD card preparation and device-unit documentation](https://github.com/michalsc/Emu68/blob/master/docs/tutorials/SD_Preparation.md)
@@ -250,4 +296,4 @@ These observations establish useful **functional validation on that configuratio
 
 ---
 
-**The essential idea:** AmigaOS still sees an ordinary disk; the snapshot lives entirely in RAM, survives the Amiga's warm reboot, and disappears when the underlying PiStorm memory loses power. That is both a useful experimental tool and a demonstration of the continuing technical relevance of AmigaOS's original resident, memory and device interfaces.
+**The essential idea:** AmigaOS still sees an ordinary disk. The snapshot grows dynamically in RAM, survives supported warm resets and disappears when PiStorm memory loses power. The on-screen **`DISPOSABLE SESSION!`** warning makes the temporary nature of the session visible without adding an external program. This is both a practical experimental tool and a demonstration of the continuing technical relevance of AmigaOS's original resident, memory and device interfaces.
