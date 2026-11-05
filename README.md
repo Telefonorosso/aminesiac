@@ -12,6 +12,8 @@ COW memory is **allocated on demand**, rather than reserving the entire configur
 
 This is not a file copier, a filesystem driver, an HDF emulator, or a modified Emu68 build. AmigaOS and its existing filesystem continue to see an ordinary block device.
 
+**The essential idea:** AmigaOS still sees an ordinary disk. The snapshot grows dynamically in RAM, survives supported warm resets and disappears when PiStorm memory loses power. The on-screen **`DISPOSABLE SESSION!`** warning makes the temporary nature of the session visible without adding an external program. This is both a practical experimental tool and a demonstration of the continuing technical relevance of AmigaOS's original resident, memory and device interfaces.
+
 > [!WARNING]
 > **Experimental storage interception — use only a disposable, fully backed-up clone of your microSD.** Functional rollback and clean filesystem checks do **not** prove that no physical sector was written. See [Safety and limitations](#safety-and-limitations) before enabling it.
 
@@ -296,4 +298,3 @@ These are functional results from the reported hardware tests, not a sector-by-s
 
 ---
 
-**The essential idea:** AmigaOS still sees an ordinary disk. The snapshot grows dynamically in RAM, survives supported warm resets and disappears when PiStorm memory loses power. The on-screen **`DISPOSABLE SESSION!`** warning makes the temporary nature of the session visible without adding an external program. This is both a practical experimental tool and a demonstration of the continuing technical relevance of AmigaOS's original resident, memory and device interfaces.
